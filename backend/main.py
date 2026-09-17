@@ -1,14 +1,11 @@
 from contextlib import asynccontextmanager
 
-from ipaddress import ip_address
-from urllib.parse import urlparse
-
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
 
 from database.database import create_database, index_stats, page_count, save_page
-from crawler.crawler import crawl_website
+from crawler.crawler import crawl_website, is_safe_crawl_url
 from indexer.index import create_index
 from search.embeddings import get_embedding_provider
 from search.service import search as run_search, suggestions
@@ -54,17 +51,6 @@ class CrawlRequest(BaseModel):
     url: HttpUrl
     max_pages: int = Field(default=10, ge=1, le=50)
     max_depth: int = Field(default=1, ge=0, le=3)
-
-
-def is_safe_crawl_url(url: str) -> bool:
-    """Prevent the public crawl endpoint from being used against local networks."""
-    hostname = urlparse(url).hostname
-    if not hostname or hostname == "localhost":
-        return False
-    try:
-        return not (ip_address(hostname).is_private or ip_address(hostname).is_loopback)
-    except ValueError:
-        return True
 
 
 @app.get("/")

@@ -2,6 +2,8 @@
 
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from ipaddress import ip_address
+import socket
 from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -14,6 +16,7 @@ from indexer.index import create_index
 
 USER_AGENT = "YEXA-Crawler/1.0 (+https://yexa.local)"
 REQUEST_TIMEOUT = 10
+MAX_REDIRECTS = 5
 
 
 @dataclass
@@ -36,6 +39,31 @@ def canonicalize_url(url: str) -> str:
     url, _ = urldefrag(url)
     parsed = urlparse(url)
     return parsed._replace(scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower()).geturl()
+
+
+def is_safe_crawl_url(url: str) -> bool:
+    """Allow only public HTTP(S) URLs, including after DNS resolution."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        return False
+    if hostname.lower() in {"localhost", "localhost.localdomain", "metadata.google.internal"}:
+        return False
+    try:
+        addresses = {ip_address(hostname)}
+    except ValueError:
+        try:
+            addresses = {
+                ip_address(result[4][0])
+                for result in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+            }
+        except socket.gaierror:
+            return False
+    return bool(addresses) and all(
+        not (address.is_private or address.is_loopback or address.is_link_local
+             or address.is_reserved or address.is_multicast or address.is_unspecified)
+        for address in addresses
+    )
 
 
 def is_html_response(response: requests.Response) -> bool:
@@ -101,6 +129,8 @@ class RobotsCache:
 def crawl_website(start_url: str, *, max_pages: int = 20, max_depth: int = 2) -> dict:
     """Crawl one domain within the supplied page/depth limits and rebuild the index."""
     start_url = canonicalize_url(start_url)
+    if not is_safe_crawl_url(start_url):
+        raise ValueError("Only public HTTP(S) websites can be crawled.")
     start_domain = urlparse(start_url).netloc
     report = CrawlReport(start_url=start_url, max_pages=max_pages, max_depth=max_depth)
     queue = deque([(start_url, 0)])
@@ -122,12 +152,33 @@ def crawl_website(start_url: str, *, max_pages: int = 20, max_depth: int = 2) ->
             continue
 
         try:
-            response = session.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            redirect_url = current_url
+            for _ in range(MAX_REDIRECTS + 1):
+                if not is_safe_crawl_url(redirect_url):
+                    report.skipped += 1
+                    report.errors.append(f"{current_url}: unsafe redirect target")
+                    break
+                response = session.get(redirect_url, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+                if getattr(response, "is_redirect", False) or getattr(response, "is_permanent_redirect", False):
+                    location = response.headers.get("Location")
+                    if not location:
+                        break
+                    redirect_url = canonicalize_url(urljoin(redirect_url, location))
+                    continue
+                break
+            else:
+                report.skipped += 1
+                report.errors.append(f"{current_url}: too many redirects")
+                continue
         except requests.RequestException as error:
             report.errors.append(f"{current_url}: {error}")
             continue
 
-        final_url = canonicalize_url(response.url)
+        final_url = canonicalize_url(response.url or redirect_url)
+        if not is_safe_crawl_url(final_url):
+            report.skipped += 1
+            report.errors.append(f"{current_url}: unsafe final URL")
+            continue
         if response.status_code != 200 or not is_html_response(response):
             report.skipped += 1
             continue

@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from crawler.crawler import canonicalize_url, crawl_website, extract_page
+from crawler.crawler import canonicalize_url, crawl_website, extract_page, is_safe_crawl_url
 from crawler.import_local import import_html_files
 from database import database
 from database.database import create_database, index_stats, save_page, search_pages
@@ -74,6 +74,26 @@ class SearchEngineTests(unittest.TestCase):
         self.assertEqual(title, "Home")
         self.assertIn("YEXA home", content)
         self.assertIn("https://example.org/guide", links)
+
+    def test_crawler_rejects_private_and_unsafe_redirect_targets(self):
+        self.assertFalse(is_safe_crawl_url("http://127.0.0.1:8000"))
+        self.assertFalse(is_safe_crawl_url("http://localhost:8000"))
+
+        response = SimpleNamespace(
+            url="https://example.org/",
+            status_code=302,
+            headers={"Location": "http://127.0.0.1:8000/admin", "Content-Type": "text/html"},
+            text="",
+            is_redirect=True,
+            is_permanent_redirect=False,
+        )
+        with patch("crawler.crawler.RobotsCache.allows", return_value=True), patch(
+            "crawler.crawler.requests.Session.get", return_value=response
+        ):
+            report = crawl_website("https://example.org/", max_pages=1, max_depth=0)
+
+        self.assertEqual(report["pages_crawled"], 0)
+        self.assertIn("unsafe redirect target", report["errors"][0])
 
 
 if __name__ == "__main__":
