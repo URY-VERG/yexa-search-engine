@@ -3,8 +3,10 @@ import math
 import re
 import sqlite3
 from collections import Counter
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import urlparse
 
 DATABASE_PATH = Path(__file__).resolve().parents[1] / "yexa.db"
@@ -22,10 +24,18 @@ def tokenize(text: str) -> list[str]:
     return [word for word in words if word not in STOP_WORDS and len(word) > 1]
 
 
-def get_connection() -> sqlite3.Connection:
+@contextmanager
+def get_connection() -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def create_database() -> None:
