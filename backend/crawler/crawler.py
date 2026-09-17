@@ -1,216 +1,149 @@
+"""A small, polite, same-domain crawler used to feed the YEXA index."""
+
+from collections import deque
+from dataclasses import asdict, dataclass, field
+from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.robotparser import RobotFileParser
+
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from urllib.robotparser import RobotFileParser
-from collections import deque
-from indexer.index import create_index
+
 from database.database import create_database, save_page
+from indexer.index import create_index
 
 
-USER_AGENT = "YEXA-Crawler/1.0"
-
-MAX_PAGES = 20
-MAX_DEPTH = 2
+USER_AGENT = "YEXA-Crawler/1.0 (+https://yexa.local)"
 REQUEST_TIMEOUT = 10
 
 
-def can_crawl(url):
-    try:
+@dataclass
+class CrawlReport:
+    start_url: str
+    max_pages: int
+    max_depth: int
+    pages_crawled: int = 0
+    pages_discovered: int = 0
+    robots_blocked: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def canonicalize_url(url: str) -> str:
+    """Drop fragments and normalize a URL enough for crawl de-duplication."""
+    url, _ = urldefrag(url)
+    parsed = urlparse(url)
+    return parsed._replace(scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower()).geturl()
+
+
+def is_html_response(response: requests.Response) -> bool:
+    return "text/html" in response.headers.get("Content-Type", "").lower()
+
+
+def extract_page(url: str, response: requests.Response) -> tuple[str, str, list[str]]:
+    """Extract readable title/content and absolute HTTP(S) links from HTML."""
+    soup = BeautifulSoup(response.text, "html.parser")
+    for element in soup(["script", "style", "noscript", "header", "footer", "nav", "svg"]):
+        element.decompose()
+
+    title = soup.title.get_text(" ", strip=True) if soup.title else url
+    text = soup.get_text(separator=" ", strip=True)
+    links = []
+    for anchor in soup.find_all("a", href=True):
+        absolute_url = canonicalize_url(urljoin(url, anchor["href"]))
+        if urlparse(absolute_url).scheme in {"http", "https"}:
+            links.append(absolute_url)
+    return title, text, list(dict.fromkeys(links))
+
+
+class RobotsCache:
+    """Fetch each domain's robots.txt once per crawl."""
+
+    def __init__(self) -> None:
+        self._parsers: dict[str, RobotFileParser | None] = {}
+
+    def allows(self, url: str) -> bool:
         parsed = urlparse(url)
-
-        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-
-        robot_parser = RobotFileParser()
-        robot_parser.set_url(robots_url)
-        robot_parser.read()
-
-        return robot_parser.can_fetch(USER_AGENT, url)
-
-    except Exception:
-        return True
-
-
-def crawl_page(url):
-
-    try:
-
-        headers = {
-            "User-Agent": USER_AGENT
-        }
-
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code != 200:
-            print(f"Skipped {url} - Status {response.status_code}")
-            return None
-
-        content_type = response.headers.get(
-            "Content-Type",
-            ""
-        )
-
-        if "text/html" not in content_type:
-            print(f"Skipped non-HTML: {url}")
-            return None
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        for element in soup([
-            "script",
-            "style",
-            "noscript",
-            "header",
-            "footer",
-            "nav"
-        ]):
-            element.decompose()
-
-        title = soup.title.string.strip() if soup.title and soup.title.string else url
-
-        text = soup.get_text(
-            separator=" ",
-            strip=True
-        )
-
-        links = []
-
-        for link in soup.find_all("a", href=True):
-
-            absolute_url = urljoin(
-                url,
-                link["href"]
-            )
-
-            parsed = urlparse(absolute_url)
-
-            if parsed.scheme in ["http", "https"]:
-
-                clean_url = absolute_url.split("#")[0]
-
-                if clean_url not in links:
-                    links.append(clean_url)
-
-        return {
-            "url": url,
-            "title": title,
-            "content": text,
-            "links": links
-        }
-
-    except requests.RequestException as error:
-
-        print(f"Request error: {url}")
-        print(error)
-
-        return None
-
-    except Exception as error:
-
-        print(f"Error processing: {url}")
-        print(error)
-
-        return None
+        key = f"{parsed.scheme}://{parsed.netloc}"
+        if key not in self._parsers:
+            parser = RobotFileParser()
+            parser.set_url(f"{key}/robots.txt")
+            try:
+                parser.read()
+                self._parsers[key] = parser
+            except OSError:
+                # A missing robots file does not prohibit crawling.
+                self._parsers[key] = None
+        parser = self._parsers[key]
+        return parser.can_fetch(USER_AGENT, url) if parser else True
 
 
-def crawl_website(start_url):
+def crawl_website(start_url: str, *, max_pages: int = 20, max_depth: int = 2) -> dict:
+    """Crawl one domain within the supplied page/depth limits and rebuild the index."""
+    start_url = canonicalize_url(start_url)
+    start_domain = urlparse(start_url).netloc
+    report = CrawlReport(start_url=start_url, max_pages=max_pages, max_depth=max_depth)
+    queue = deque([(start_url, 0)])
+    queued = {start_url}
+    visited: set[str] = set()
+    robots = RobotsCache()
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
 
-    parsed_start = urlparse(start_url)
-
-    base_domain = parsed_start.netloc
-
-    queue = deque()
-
-    queue.append(
-        (start_url, 0)
-    )
-
-    visited = set()
-
-    pages_crawled = 0
-
-    print("\n==============================")
-    print("       YEXA WEB CRAWLER")
-    print("==============================\n")
-
-    while queue and pages_crawled < MAX_PAGES:
-
+    create_database()
+    while queue and report.pages_crawled < max_pages:
         current_url, depth = queue.popleft()
-
         if current_url in visited:
             continue
-
-        if depth > MAX_DEPTH:
-            continue
-
         visited.add(current_url)
 
-        print(
-            f"[{pages_crawled + 1}/{MAX_PAGES}] Crawling: {current_url}"
-        )
-
-        if not can_crawl(current_url):
-
-            print("Blocked by robots.txt\n")
-
+        if not robots.allows(current_url):
+            report.robots_blocked += 1
             continue
 
-        page = crawl_page(current_url)
-
-        if page is None:
+        try:
+            response = session.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        except requests.RequestException as error:
+            report.errors.append(f"{current_url}: {error}")
             continue
 
-        save_page(
-            page["url"],
-            page["title"],
-            page["content"]
-        )
+        final_url = canonicalize_url(response.url)
+        if response.status_code != 200 or not is_html_response(response):
+            report.skipped += 1
+            continue
+        if urlparse(final_url).netloc != start_domain:
+            report.skipped += 1
+            continue
 
-        pages_crawled += 1
+        title, content, links = extract_page(final_url, response)
+        if not content:
+            report.skipped += 1
+            continue
 
-        print(
-            f"Saved: {page['title']}"
-        )
+        save_page(final_url, title, content, crawl_depth=depth, http_status=response.status_code)
+        report.pages_crawled += 1
 
-        print(
-            f"Found links: {len(page['links'])}\n"
-        )
+        if depth >= max_depth:
+            continue
+        for link in links:
+            if urlparse(link).netloc == start_domain and link not in queued and link not in visited:
+                queued.add(link)
+                queue.append((link, depth + 1))
+                report.pages_discovered += 1
 
-        for link in page["links"]:
-
-            parsed_link = urlparse(link)
-
-            if parsed_link.netloc == base_domain:
-
-                if link not in visited:
-
-                    queue.append(
-                        (link, depth + 1)
-                    )
-
-    print("==============================")
-    print(
-        f"YEXA crawled {pages_crawled} pages."
-    )
-    print("==============================\n")
+    if report.pages_crawled:
+        create_index()
+    return report.to_dict()
 
 
 if __name__ == "__main__":
+    import argparse
 
-    create_database()
-
-    start_url = "https://example.com"
-
-    crawl_website(start_url)
-
-    print("Updating YEXA search index...")
-
-    create_index()
-
-    print("YEXA indexing completed.")
+    parser = argparse.ArgumentParser(description="Crawl one website into the YEXA index.")
+    parser.add_argument("url", help="Starting HTTP(S) URL")
+    parser.add_argument("--max-pages", type=int, default=20)
+    parser.add_argument("--max-depth", type=int, default=2)
+    args = parser.parse_args()
+    print(crawl_website(args.url, max_pages=args.max_pages, max_depth=args.max_depth))

@@ -2,9 +2,10 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from database.database import create_database, save_page
+from indexer.index import create_index
 
 
-def import_html_file(file_path):
+def import_html_file(file_path: str | Path) -> str:
 
     html = Path(file_path).read_text(
         encoding="utf-8"
@@ -37,23 +38,27 @@ def import_html_file(file_path):
         text
     )
 
-    print(
-        f"Saved: {title}"
-    )
+    return title
+
+
+def import_html_files(file_paths: list[str | Path]) -> dict[str, int]:
+    """Import local HTML files and rebuild the index once at the end."""
+    create_database()
+    imported = 0
+    for file_path in file_paths:
+        import_html_file(file_path)
+        imported += 1
+    index_result = create_index()
+    return {"imported": imported, **index_result}
 
 
 if __name__ == "__main__":
 
 
-    create_database()
-
+    base_directory = Path(__file__).resolve().parents[1]
     files = [
-        "test_pages/flutter.html",
-        "test_pages/python.html",
-        "test_pages/ai.html"
+        base_directory / "test_pages/flutter.html",
+        base_directory / "test_pages/python.html",
+        base_directory / "test_pages/ai.html",
     ]
-
-    for file in files:
-        import_html_file(file)
-
-    print("\nAll test pages imported successfully.")
+    print(import_html_files(files))

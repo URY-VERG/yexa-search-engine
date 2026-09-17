@@ -1,3 +1,4 @@
+import hashlib
 import math
 import re
 import sqlite3
@@ -40,6 +41,15 @@ def create_database() -> None:
                 crawled_at TEXT NOT NULL
             )
         """)
+        # Keep the database compatible with earlier YEXA installations.
+        existing_columns = {row[1] for row in cursor.execute("PRAGMA table_info(pages)")}
+        for column, definition in (
+            ("crawl_depth", "INTEGER"),
+            ("http_status", "INTEGER"),
+            ("content_hash", "TEXT"),
+        ):
+            if column not in existing_columns:
+                cursor.execute(f"ALTER TABLE pages ADD COLUMN {column} {definition}")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS inverted_index (
                 term TEXT NOT NULL,
@@ -63,18 +73,36 @@ def create_database() -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tfidf_page ON tfidf_index(page_id)")
 
 
-def save_page(url: str, title: str, content: str) -> None:
+def save_page(
+    url: str,
+    title: str,
+    content: str,
+    *,
+    crawl_depth: int | None = None,
+    http_status: int | None = None,
+) -> None:
     """Insert or replace a document. Call create_index afterwards to search it."""
     crawl_time = datetime.now(UTC).isoformat()
     with get_connection() as connection:
         connection.execute("""
-            INSERT INTO pages (url, title, content, crawled_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO pages (url, title, content, crawled_at, crawl_depth, http_status, content_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 content = excluded.content,
-                crawled_at = excluded.crawled_at
-        """, (url, title.strip(), content.strip(), crawl_time))
+                crawled_at = excluded.crawled_at,
+                crawl_depth = excluded.crawl_depth,
+                http_status = excluded.http_status,
+                content_hash = excluded.content_hash
+        """, (
+            url,
+            title.strip(),
+            content.strip(),
+            crawl_time,
+            crawl_depth,
+            http_status,
+            hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        ))
 
 
 def page_count() -> int:
@@ -162,16 +190,31 @@ def search_pages(query: str, limit: int = 10) -> list[dict]:
             title_matches = sum(term in title_lower for term in query_words)
             content_matches = sum(term in content_lower for term in query_words)
             url_matches = sum(term in url_lower for term in query_words)
+            title_relevance = title_matches * 10
+            content_relevance = content_matches * 3
+            url_relevance = url_matches * 5
             phrase_score = 15 if phrase in title_lower else 8 if phrase in content_lower else 0
             source_quality = calculate_source_quality(page["url"])
             freshness = calculate_freshness(page["crawled_at"])
-            score = (similarity * 60 + title_matches * 10 + content_matches * 3 + url_matches * 5
-                     + phrase_score + source_quality * 0.10 + freshness * 0.10)
+            tfidf_score = similarity * 60
+            source_score = source_quality * 0.10
+            freshness_score = freshness * 0.10
+            score = (tfidf_score + title_relevance + content_relevance + url_relevance
+                     + phrase_score + source_score + freshness_score)
             if similarity or title_matches or content_matches or phrase_score:
                 results.append({
                     "id": page["id"], "url": page["url"], "title": page["title"], "content": page["content"],
                     "score": round(score, 2), "similarity": round(similarity, 4),
                     "source_quality": source_quality, "freshness": freshness,
                     "match_summary": f"Matched {title_matches} title and {content_matches} content term(s).",
+                    "ranking": {
+                        "tfidf_similarity": round(tfidf_score, 2),
+                        "title_relevance": title_relevance,
+                        "content_relevance": content_relevance,
+                        "url_relevance": url_relevance,
+                        "exact_phrase": phrase_score,
+                        "source_quality": round(source_score, 2),
+                        "freshness": round(freshness_score, 2),
+                    },
                 })
     return sorted(results, key=lambda item: item["score"], reverse=True)[:limit]

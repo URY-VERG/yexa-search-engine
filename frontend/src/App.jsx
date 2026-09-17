@@ -2,6 +2,15 @@ import { useEffect, useState } from "react";
 import "./App.css";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "/api";
+const rankingLabels = {
+  tfidf_similarity: "Keyword similarity",
+  title_relevance: "Title relevance",
+  content_relevance: "Content relevance",
+  url_relevance: "URL relevance",
+  exact_phrase: "Exact phrase",
+  source_quality: "Source quality",
+  freshness: "Freshness",
+};
 
 function App() {
   const [query, setQuery] = useState("");
@@ -142,7 +151,7 @@ function App() {
               </button>
 
               <button onClick={() => handleSearch("artificial intelligence")}>
-                Artificial Intelligence
+                AI
               </button>
             </div>
           )}
@@ -186,8 +195,8 @@ function App() {
             )}
 
             {!loading &&
-              results.map((result, index) => (
-                <article className="result-card" key={index}>
+              results.map((result) => (
+                <article className="result-card" key={result.id}>
 
                   <a
                     href={result.url}
@@ -233,9 +242,17 @@ function App() {
                   </button>
 
                   {expandedResult === result.id && (
-                    <p className="ranking-details">
-                      {result.match_summary} Freshness: {result.freshness}/100.
-                    </p>
+                    <div className="ranking-details">
+                      <p>{result.match_summary}</p>
+                      <ul>
+                        {Object.entries(result.ranking || {}).map(([signal, value]) => (
+                          <li key={signal}>
+                            <span>{rankingLabels[signal] || signal}</span>
+                            <strong>+{value}</strong>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                   )}
 
                 </article>
