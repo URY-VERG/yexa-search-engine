@@ -1,0 +1,17 @@
+# Python runtime files
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/yexa.db
+*.py[cod]
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Local configuration and editor files
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
