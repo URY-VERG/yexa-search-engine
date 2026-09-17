@@ -8,7 +8,7 @@ from urllib.robotparser import RobotFileParser
 import requests
 from bs4 import BeautifulSoup
 
-from database.database import create_database, save_page
+from database.database import create_database, replace_links, save_page
 from indexer.index import create_index
 
 
@@ -56,6 +56,24 @@ def extract_page(url: str, response: requests.Response) -> tuple[str, str, list[
         if urlparse(absolute_url).scheme in {"http", "https"}:
             links.append(absolute_url)
     return title, text, list(dict.fromkeys(links))
+
+
+def extract_metadata_and_anchors(url: str, response: requests.Response) -> tuple[dict, list[tuple[str, str]]]:
+    """Extract non-rendered crawl metadata and anchor text without storing HTML."""
+    soup = BeautifulSoup(response.text, "html.parser")
+    description_tag = soup.find("meta", attrs={"name": "description"})
+    language = soup.html.get("lang") if soup.html else None
+    anchors = []
+    for anchor in soup.find_all("a", href=True):
+        target = canonicalize_url(urljoin(url, anchor["href"]))
+        if urlparse(target).scheme in {"http", "https"}:
+            anchors.append((target, anchor.get_text(" ", strip=True)))
+    return {
+        "meta_description": description_tag.get("content", "").strip() if description_tag else None,
+        "language": language,
+        "last_modified": response.headers.get("Last-Modified"),
+        "etag": response.headers.get("ETag"),
+    }, anchors
 
 
 class RobotsCache:
@@ -122,7 +140,11 @@ def crawl_website(start_url: str, *, max_pages: int = 20, max_depth: int = 2) ->
             report.skipped += 1
             continue
 
-        save_page(final_url, title, content, crawl_depth=depth, http_status=response.status_code)
+        metadata, anchors = extract_metadata_and_anchors(final_url, response)
+        page_id = save_page(
+            final_url, title, content, crawl_depth=depth, http_status=response.status_code, metadata=metadata
+        )
+        replace_links(page_id, anchors)
         report.pages_crawled += 1
 
         if depth >= max_depth:

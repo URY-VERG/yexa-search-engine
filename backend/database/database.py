@@ -47,6 +47,12 @@ def create_database() -> None:
             ("crawl_depth", "INTEGER"),
             ("http_status", "INTEGER"),
             ("content_hash", "TEXT"),
+            ("first_crawled_at", "TEXT"),
+            ("last_seen_at", "TEXT"),
+            ("last_modified", "TEXT"),
+            ("etag", "TEXT"),
+            ("meta_description", "TEXT"),
+            ("language", "TEXT"),
         ):
             if column not in existing_columns:
                 cursor.execute(f"ALTER TABLE pages ADD COLUMN {column} {definition}")
@@ -68,9 +74,27 @@ def create_database() -> None:
                 FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS document_stats (
+                page_id INTEGER PRIMARY KEY,
+                document_length INTEGER NOT NULL,
+                authority REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS links (
+                source_page_id INTEGER NOT NULL,
+                target_url TEXT NOT NULL,
+                anchor_text TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (source_page_id, target_url),
+                FOREIGN KEY (source_page_id) REFERENCES pages(id) ON DELETE CASCADE
+            )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pages_url ON pages(url)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_inverted_page ON inverted_index(page_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tfidf_page ON tfidf_index(page_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_url)")
 
 
 def save_page(
@@ -80,20 +104,29 @@ def save_page(
     *,
     crawl_depth: int | None = None,
     http_status: int | None = None,
-) -> None:
+    metadata: dict | None = None,
+) -> int:
     """Insert or replace a document. Call create_index afterwards to search it."""
     crawl_time = datetime.now(UTC).isoformat()
+    metadata = metadata or {}
     with get_connection() as connection:
         connection.execute("""
-            INSERT INTO pages (url, title, content, crawled_at, crawl_depth, http_status, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO pages (url, title, content, crawled_at, crawl_depth, http_status, content_hash,
+                first_crawled_at, last_seen_at, last_modified, etag, meta_description, language)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 content = excluded.content,
                 crawled_at = excluded.crawled_at,
                 crawl_depth = excluded.crawl_depth,
                 http_status = excluded.http_status,
-                content_hash = excluded.content_hash
+                content_hash = excluded.content_hash,
+                first_crawled_at = COALESCE(pages.first_crawled_at, excluded.first_crawled_at),
+                last_seen_at = excluded.last_seen_at,
+                last_modified = excluded.last_modified,
+                etag = excluded.etag,
+                meta_description = excluded.meta_description,
+                language = excluded.language
         """, (
             url,
             title.strip(),
@@ -102,7 +135,24 @@ def save_page(
             crawl_depth,
             http_status,
             hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            crawl_time,
+            crawl_time,
+            metadata.get("last_modified"),
+            metadata.get("etag"),
+            metadata.get("meta_description"),
+            metadata.get("language"),
         ))
+        return connection.execute("SELECT id FROM pages WHERE url = ?", (url,)).fetchone()[0]
+
+
+def replace_links(source_page_id: int, links: list[tuple[str, str]]) -> None:
+    """Store outgoing links and anchor text for one crawled document."""
+    with get_connection() as connection:
+        connection.execute("DELETE FROM links WHERE source_page_id = ?", (source_page_id,))
+        connection.executemany(
+            "INSERT OR IGNORE INTO links (source_page_id, target_url, anchor_text) VALUES (?, ?, ?)",
+            [(source_page_id, url, text[:500]) for url, text in links],
+        )
 
 
 def page_count() -> int:

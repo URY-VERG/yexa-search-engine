@@ -7,9 +7,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
 
-from database.database import create_database, index_stats, page_count, save_page, search_pages
+from database.database import create_database, index_stats, page_count, save_page
 from crawler.crawler import crawl_website
 from indexer.index import create_index
+from search.embeddings import get_embedding_provider
+from search.service import search as run_search, suggestions
 
 
 def seed_demo_documents() -> None:
@@ -72,7 +74,8 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", **index_stats()}
+    provider = get_embedding_provider()
+    return {"status": "ok", "semantic_search": provider.available(), **index_stats()}
 
 
 @app.get("/stats")
@@ -81,11 +84,19 @@ def stats():
 
 
 @app.get("/search")
-def search(query: str = Query(min_length=1, max_length=200), limit: int = Query(default=10, ge=1, le=20)):
-    results = search_pages(query, limit)
-    return {"query": query, "total_results": len(results), "results": [
-        {**result, "description": result["content"][:300]} for result in results
-    ]}
+def search(
+    query: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=10, ge=1, le=20),
+    offset: int = Query(default=0, ge=0),
+    domain: str | None = Query(default=None, max_length=255),
+    freshness_days: int | None = Query(default=None, ge=1, le=3650),
+):
+    return run_search(query, limit=limit, offset=offset, domain=domain, freshness_days=freshness_days)
+
+
+@app.get("/suggestions")
+def query_suggestions(query: str = Query(min_length=1, max_length=100), limit: int = Query(default=6, ge=1, le=10)):
+    return {"query": query, "suggestions": suggestions(query, limit)}
 
 
 @app.post("/documents", status_code=201)
